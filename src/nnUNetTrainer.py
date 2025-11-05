@@ -8,11 +8,11 @@ from copy import deepcopy
 from datetime import datetime
 from time import time, sleep
 from typing import Tuple, Union, List
+from sklearn.metrics import f1_score
 
 import numpy as np
 import torch
-import csv
-from sklearn.metrics import f1_score, accuracy_score, classification_report, confusion_matrix
+import wandb
 from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
 from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
@@ -145,6 +145,12 @@ class nnUNetTrainer(object):
 
         ### Some hyperparameters for you to fiddle with
         self.initial_lr = 1e-2
+
+        self.use_lr_override = False
+        self.override_lr_value = 8e-4
+
+        self.freeze_segmentation = False
+
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.probabilistic_oversampling = False
@@ -165,24 +171,19 @@ class nnUNetTrainer(object):
         self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
 
-        ### Classification setup
+        ### Classification head
+        self.lambda_cls = 3
         self.num_classes_cls = 3
-        self.weight_cls = 0.5
-        self.cls_metrics = {'preds': [], 'targets': [], 'losses': []}
-        self.class_labels = {}
+        class_counts = torch.tensor([62, 106, 84], dtype=torch.float, device=self.device)
+        class_weights = class_counts.sum() / class_counts
+        class_weights = class_weights / class_weights.mean()
 
-        csv_path = "/content/drive/MyDrive/PC-Classifier/nnUNet_raw/Dataset310_Pancreas/subtype_labels.csv"
+        #class_weights[0] *= 1.3
+        #class_weights[1] *= 1.1
+        class_weights[2] *= 1.2
+        class_weights = class_weights / class_weights.mean()
 
-        if isfile(csv_path):
-            with open(csv_path, newline='') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    name = row['Filename']
-                    label = int(row['Subtype'])
-                    self.class_labels[name] = label
-            self.print_to_log_file(f"[Classification] Loaded {len(self.class_labels)} subtype labels from {csv_path}")
-        else:
-            self.print_to_log_file(f"[Classification] CSV not found at {csv_path}, classification branch disabled.")
+        self.cls_loss = torch.nn.CrossEntropyLoss(weight=class_weights)
 
         ### Simple logging. Don't take that away from me!
         # initialize log file. This is just our log for the print statements etc. Not to be confused with lightning
@@ -205,7 +206,7 @@ class nnUNetTrainer(object):
         # self.configure_rotation_dummyDA_mirroring_and_inital_patch_size and will be saved in checkpoints
 
         ### checkpoint saving stuff
-        self.save_every = 50
+        self.save_every = 25
         self.disable_checkpointing = False
 
         self.was_initialized = False
@@ -236,15 +237,13 @@ class nnUNetTrainer(object):
                 self.enable_deep_supervision
             ).to(self.device)
 
-            # classification head
-            self.cls_head = nn.Sequential(
-                nn.Linear(320, 128),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(128, self.num_classes_cls)
-            ).to(self.device)
-            self.cls_loss_fn = nn.CrossEntropyLoss()
-            self.print_to_log_file("[Classification] Head initialized")
+            if hasattr(self.network, "classification_head") and self.network.classification_head is not None:
+                nn.init.xavier_uniform_(self.network.classification_head.weight)
+                nn.init.constant_(self.network.classification_head.bias, 0)
+            else:
+                self.lambda_cls = 0
+                self.print_to_log_file("No classification head detected. Classification disabled (λ_cls=0).")
+
 
             # compile network for free speedup
             if self._do_i_compile():
@@ -296,6 +295,16 @@ class nnUNetTrainer(object):
             return True
         else:
             return os.environ['nnUNet_compile'].lower() in ('true', '1', 't')
+
+    def freeze_segmentation_layers(self):
+      if hasattr(self.network, "encoder"):
+          for param in self.network.encoder.parameters():
+              param.requires_grad = False
+      if hasattr(self.network, "decoder"):
+          for param in self.network.decoder.parameters():
+              param.requires_grad = False
+      print("Segmentation layers frozen. Only classification head will train.")
+
 
     def _save_debug_information(self):
         # saving some debug information
@@ -927,17 +936,50 @@ class nnUNetTrainer(object):
         if not self.was_initialized:
             self.initialize()
 
+        self.print_to_log_file(f"Classification weight λ_cls = {self.lambda_cls}")
+
+        if self.local_rank == 0:  # Only on main process
+            wandb.init(
+                project="nnunet_multitask",
+                name=f"{self.plans_manager.dataset_name}_fold{self.fold}",
+                config={
+                    "lambda_cls": self.lambda_cls,
+                    "learning_rate": self.initial_lr,
+                    "batch_size": self.configuration_manager.batch_size,
+                    "architecture": self.configuration_manager.network_arch_class_name,
+                    "num_classes_cls": self.num_classes_cls,
+                    "num_epochs": self.num_epochs,
+                },
+            )
+
+        if self.use_lr_override:
+            for g in self.optimizer.param_groups:
+                g["lr"] = self.override_lr_value
+            self.lr_scheduler.initial_lr = self.override_lr_value
+            self.initial_lr = self.override_lr_value
+            self.print_to_log_file(f"LR override active → Using {self.override_lr_value}")
+        else:
+            self.print_to_log_file(f"LR override disabled → Using default {self.initial_lr}")
+
+
         # dataloaders must be instantiated here (instead of __init__) because they need access to the training data
         # which may not be present  when doing inference
         self.dataloader_train, self.dataloader_val = self.get_dataloaders()
 
         maybe_mkdir_p(self.output_folder)
 
+        for k in ('val_cls_f1', 'val_cls_acc', 'val_cls_loss'):
+            if k not in self.logger.my_fantastic_logging:
+                self.logger.my_fantastic_logging[k] = []
+
         # make sure deep supervision is on in the network
         self.set_deep_supervision_enabled(self.enable_deep_supervision)
 
         self.print_plans()
         empty_cache(self.device)
+
+        if self.freeze_segmentation:
+            self.freeze_segmentation_layers()
 
         # maybe unpack
         if self.local_rank == 0:
@@ -992,6 +1034,9 @@ class nnUNetTrainer(object):
         empty_cache(self.device)
         self.print_to_log_file("Training done.")
 
+        if self.local_rank == 0:
+            wandb.finish()
+
     def on_train_epoch_start(self):
         self.network.train()
         self.lr_scheduler.step(self.current_epoch)
@@ -1006,6 +1051,8 @@ class nnUNetTrainer(object):
         data = batch['data']
         target = batch['target']
 
+        subtypes = torch.tensor([p["case_subtype"] for p in batch["properties"]], dtype=torch.long).to(self.device)
+
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
@@ -1019,8 +1066,22 @@ class nnUNetTrainer(object):
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
-            # del data
-            l = self.loss(output, target)
+
+            if isinstance(output, tuple):
+                seg_output, cls_output = output
+            else:
+                seg_output, cls_output = output, None
+            # Compute segmentation loss
+            l_seg = self.loss(seg_output, target)
+            # Compute classification loss (optional if head exists)
+            l_cls = 0
+            if cls_output is not None:
+                l_cls = self.cls_loss(cls_output, subtypes)
+            # Combine segmentation + classification losses safely
+            if cls_output is not None and self.lambda_cls > 0:
+                l = l_seg + self.lambda_cls * l_cls
+            else:
+                l = l_seg
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1046,6 +1107,13 @@ class nnUNetTrainer(object):
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
 
+        if self.local_rank == 0:
+            wandb.log({
+                "train/total_loss": loss_here,
+                "train/lr": self.optimizer.param_groups[0]['lr'],
+                "epoch": self.current_epoch,
+            })
+
     def on_validation_epoch_start(self):
         self.network.eval()
 
@@ -1053,68 +1121,105 @@ class nnUNetTrainer(object):
         data = batch['data']
         target = batch['target']
 
+        subtypes = torch.tensor([p["case_subtype"] for p in batch["properties"]], dtype=torch.long).to(self.device)
+
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
 
-        # Autocast can be annoying
-        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
-        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
-        # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        # Forward pass with autocast on CUDA
+        with autocast(self.device.type, enabled=(self.device.type == 'cuda')):
             output = self.network(data)
             del data
-            l = self.loss(output, target)
 
-        # we only need the output with the highest output resolution (if DS enabled)
+            # Handle dual head models
+            if isinstance(output, tuple):
+                seg_output, cls_output = output
+            else:
+                seg_output, cls_output = output, None
+
+            # Segmentation loss
+            l_seg = self.loss(seg_output, target)
+
+            # Classification loss if head exists
+            l_cls = 0
+            if cls_output is not None:
+                l_cls = self.cls_loss(cls_output, subtypes)
+
+            # Total loss
+            l = l_seg + (self.lambda_cls * l_cls if cls_output is not None and self.lambda_cls > 0 else 0)
+
+        # Use highest resolution output for metrics when deep supervision is enabled
         if self.enable_deep_supervision:
-            output = output[0]
-            target = target[0]
-
-        # the following is needed for online evaluation. Fake dice (green line)
-        axes = [0] + list(range(2, output.ndim))
-
-        if self.label_manager.has_regions:
-            predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
+            seg_for_metrics = seg_output[0]
+            tgt_for_metrics = target[0]
         else:
-            # no need for softmax
-            output_seg = output.argmax(1)[:, None]
-            predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
-            predicted_segmentation_onehot.scatter_(1, output_seg, 1)
+            seg_for_metrics = seg_output
+            tgt_for_metrics = target
+
+        # Build one-hot prediction
+        if self.label_manager.has_regions:
+            predicted_segmentation_onehot = (torch.sigmoid(seg_for_metrics) > 0.5).long()
+        else:
+            output_seg = seg_for_metrics.argmax(1, keepdim=True)  # (B,1,...)
+            predicted_segmentation_onehot = torch.zeros_like(seg_for_metrics, dtype=torch.float32)
+            predicted_segmentation_onehot.scatter_(1, output_seg, 1.0)
             del output_seg
 
+        # Ignore label mask
         if self.label_manager.has_ignore_label:
             if not self.label_manager.has_regions:
-                mask = (target != self.label_manager.ignore_label).float()
-                # CAREFUL that you don't rely on target after this line!
-                target[target == self.label_manager.ignore_label] = 0
+                mask = (tgt_for_metrics != self.label_manager.ignore_label).float()
+                tgt_for_metrics = tgt_for_metrics.clone()
+                tgt_for_metrics[tgt_for_metrics == self.label_manager.ignore_label] = 0
             else:
-                if target.dtype == torch.bool:
-                    mask = ~target[:, -1:]
+                if tgt_for_metrics.dtype == torch.bool:
+                    mask = ~tgt_for_metrics[:, -1:]
                 else:
-                    mask = 1 - target[:, -1:]
-                # CAREFUL that you don't rely on target after this line!
-                target = target[:, :-1]
+                    mask = 1 - tgt_for_metrics[:, -1:]
+                tgt_for_metrics = tgt_for_metrics[:, :-1]
         else:
             mask = None
 
-        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
+        # Dice ingredients
+        axes = [0] + list(range(2, seg_for_metrics.ndim))
+        tp, fp, fn, _ = get_tp_fp_fn_tn(
+            predicted_segmentation_onehot, tgt_for_metrics, axes=axes, mask=mask
+        )
 
         tp_hard = tp.detach().cpu().numpy()
         fp_hard = fp.detach().cpu().numpy()
         fn_hard = fn.detach().cpu().numpy()
+
+        # Drop background for class-wise metrics in class setup
         if not self.label_manager.has_regions:
-            # if we train with regions all segmentation heads predict some kind of foreground. In conventional
-            # (softmax training) there needs tobe one output for the background. We are not interested in the
-            # background Dice
-            # [1:] in order to remove background
             tp_hard = tp_hard[1:]
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        # Classification metrics
+        cls_acc, cls_f1 = None, None
+        if cls_output is not None:
+            preds = torch.argmax(cls_output, dim=1)
+            correct = (preds == subtypes).sum().item()
+            total = subtypes.size(0)
+            cls_acc = correct / total
+
+            preds_np = preds.detach().cpu().numpy()
+            true_np = subtypes.detach().cpu().numpy()
+            cls_f1 = f1_score(true_np, preds_np, average='macro')
+
+        return {
+            'loss': l.detach().cpu().numpy(),
+            'tp_hard': tp_hard,
+            'fp_hard': fp_hard,
+            'fn_hard': fn_hard,
+            'cls_loss': l_cls.detach().cpu().numpy() if cls_output is not None else 0,
+            'cls_acc': cls_acc,
+            'cls_f1': cls_f1
+        }
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
@@ -1143,11 +1248,54 @@ class nnUNetTrainer(object):
         else:
             loss_here = np.mean(outputs_collated['loss'])
 
+        # Classification metrics
+        cls_accs = [x for x in outputs_collated.get('cls_acc', []) if x is not None]
+        cls_loss = [x for x in outputs_collated.get('cls_loss', []) if x is not None]
+        cls_f1s = [x for x in outputs_collated.get('cls_f1', []) if x is not None]
+
+        mean_cls_f1 = np.mean(cls_f1s) if cls_f1s else 0
+        self.logger.log('val_cls_f1', mean_cls_f1, self.current_epoch)
+
+        mean_cls_acc = np.mean(cls_accs) if cls_accs else 0
+        mean_cls_loss = np.mean(cls_loss) if cls_loss else 0
+
         global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
         mean_fg_dice = np.nanmean(global_dc_per_class)
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
+        self.logger.log('val_cls_acc', mean_cls_acc, self.current_epoch)
+        self.logger.log('val_cls_loss', mean_cls_loss, self.current_epoch)
+
+        # Exponential moving average of classification F1 (for stability)
+        if 'ema_cls_f1' not in self.logger.my_fantastic_logging:
+            self.logger.my_fantastic_logging['ema_cls_f1'] = [mean_cls_f1]
+        else:
+            prev_ema = self.logger.my_fantastic_logging['ema_cls_f1'][-1]
+            new_ema = 0.9 * prev_ema + 0.1 * mean_cls_f1
+            self.logger.my_fantastic_logging['ema_cls_f1'].append(new_ema)
+
+        if self.local_rank == 0:
+            print(f"Val Dice: {mean_fg_dice:.4f} | Cls Acc: {mean_cls_acc:.4f} | Cls F1: {mean_cls_f1:.4f} | Cls Loss: {mean_cls_loss:.4f}")
+
+            wandb.log({
+                "val/total_loss": loss_here,
+                "val/seg_dice_mean": mean_fg_dice,
+                "val/cls_f1": mean_cls_f1,
+                "val/cls_acc": mean_cls_acc,
+                "val/cls_loss": mean_cls_loss,
+                "epoch": self.current_epoch,
+            })
+
+        # save best f1 checkpoint
+        if not hasattr(self, "best_val_f1"):
+            self.best_val_f1 = 0.0
+
+        if mean_cls_f1 > self.best_val_f1:
+            self.best_val_f1 = mean_cls_f1
+            self.print_to_log_file(f"New best F1: {mean_cls_f1:.4f}, saving checkpoint_best_f1.pth")
+            self.save_checkpoint(join(self.output_folder, "checkpoint_best_f1.pth"))
+
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
@@ -1209,6 +1357,8 @@ class nnUNetTrainer(object):
 
         if isinstance(filename_or_checkpoint, str):
             checkpoint = torch.load(filename_or_checkpoint, map_location=self.device, weights_only=False)
+        else:
+            checkpoint = filename_or_checkpoint
         # if state dict comes from nn.DataParallel but we use non-parallel model here then the state dict keys do not
         # match. Use heuristic to make it match
         new_state_dict = {}
