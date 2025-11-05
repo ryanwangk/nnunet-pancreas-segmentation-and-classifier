@@ -109,8 +109,6 @@ Code to compute evaluation metrics could be found in the [Colab Notebook](https:
 
 ## Results
 
-Our method achieves the following performance on [Brain Tumor Segmentation (BraTS) Challenge](https://www.med.upenn.edu/cbica/brats2020/)
-
 | Model name       |  Whole Pancreas DSC  | Pancreas Lesion DSC | Classification F1 |
 | ---------------- | :----: | :--------------------: |:--------------------:|
 | model425         | 0.86  |  0.5062                | 0.6018 |
