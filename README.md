@@ -79,7 +79,6 @@ nnUNetv2_plan_and_preprocess -d <dataset_id> -pl nnUNetPlannerResEncM --verify_d
    
    You can download trained models here:
    
-   - [Model 1](https://drive.google.com/file/d/1AjwlB7_Tr9rp2EFrqzK_HiIsnqT_W8XV/view?usp=share_link) 
    
 
 2. [Colab Jupyter Notebook](https://colab.research.google.com/drive/1v-huIhSNIyNtM44VgRGEwqYQDi_FTW1r?usp=sharing)
@@ -111,7 +110,7 @@ Code to compute evaluation metrics could be found in the [Colab Notebook](https:
 
 | Model name       |  Whole Pancreas DSC  | Pancreas Lesion DSC | Classification F1 |
 | ---------------- | :----: | :--------------------: |:--------------------:|
-| model425         | 0.86  |  0.5062                | 0.6018 |
+| -        | -  |  -              | - |
 
 
 ## References and Acknowledgement
