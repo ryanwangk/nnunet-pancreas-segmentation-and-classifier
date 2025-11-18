@@ -184,9 +184,15 @@ class ResidualEncoderUNet(AbstractDynamicNetworkArchitectures):
         skips = self.encoder(x)
         seg = self.decoder(skips)
 
-        dec_feat = skips[-1]                  # shape [B, 320, D, H, W]
-        pooled = self.gap(dec_feat).flatten(1)  # [B, 320]
-        cls = self.classification_head(pooled)  # [B, 3]
+        # dec_feat = skips[-1]                  # shape [B, 320, D, H, W]
+        # pooled = self.gap(dec_feat).flatten(1)  # [B, 320]
+        # cls = self.classification_head(pooled)  # [B, 3]
+
+        dec_feat = skips[-1]  # [B, C, D, H, W]
+        # Collapse depth dimension via mean projection
+        dec_feat_2d = dec_feat.mean(dim=2)   # -> [B, C, H, W]
+        pooled = nn.functional.adaptive_avg_pool2d(dec_feat_2d, 1).flatten(1)  # [B, C]
+        cls = self.classification_head(pooled)
 
         return seg, cls
 

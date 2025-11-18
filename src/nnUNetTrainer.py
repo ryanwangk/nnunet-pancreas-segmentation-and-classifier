@@ -172,7 +172,7 @@ class nnUNetTrainer(object):
         self.loss = None  # -> self.initialize
 
         ### Classification head
-        self.lambda_cls = 3
+        self.lambda_cls = 0.5
         self.num_classes_cls = 3
         class_counts = torch.tensor([62, 106, 84], dtype=torch.float, device=self.device)
         class_weights = class_counts.sum() / class_counts
@@ -180,8 +180,8 @@ class nnUNetTrainer(object):
 
         #class_weights[0] *= 1.3
         #class_weights[1] *= 1.1
-        class_weights[2] *= 1.2
-        class_weights = class_weights / class_weights.mean()
+        #class_weights[2] *= 1.2
+        #class_weights = class_weights / class_weights.mean()
 
         self.cls_loss = torch.nn.CrossEntropyLoss(weight=class_weights)
 
@@ -237,12 +237,9 @@ class nnUNetTrainer(object):
                 self.enable_deep_supervision
             ).to(self.device)
 
-            if hasattr(self.network, "classification_head") and self.network.classification_head is not None:
-                nn.init.xavier_uniform_(self.network.classification_head.weight)
-                nn.init.constant_(self.network.classification_head.bias, 0)
-            else:
-                self.lambda_cls = 0
-                self.print_to_log_file("No classification head detected. Classification disabled (λ_cls=0).")
+            self.cls_head = nn.Linear(self.label_manager.num_segmentation_heads, self.num_classes_cls).to(self.device)
+            nn.init.xavier_uniform_(self.cls_head.weight)
+            nn.init.constant_(self.cls_head.bias, 0)
 
 
             # compile network for free speedup
@@ -546,8 +543,8 @@ class nnUNetTrainer(object):
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
-                                    momentum=0.99, nesterov=True)
+        params = list(self.network.parameters()) + list(self.cls_head.parameters())
+        optimizer = torch.optim.SGD(params, self.initial_lr, weight_decay=self.weight_decay, momentum=0.99, nesterov=True)
         lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
         return optimizer, lr_scheduler
 
@@ -1066,32 +1063,25 @@ class nnUNetTrainer(object):
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
-
-            if isinstance(output, tuple):
-                seg_output, cls_output = output
-            else:
-                seg_output, cls_output = output, None
-            # Compute segmentation loss
+            seg_output = output[0] if isinstance(output, tuple) else output
             l_seg = self.loss(seg_output, target)
-            # Compute classification loss (optional if head exists)
-            l_cls = 0
-            if cls_output is not None:
-                l_cls = self.cls_loss(cls_output, subtypes)
-            # Combine segmentation + classification losses safely
-            if cls_output is not None and self.lambda_cls > 0:
-                l = l_seg + self.lambda_cls * l_cls
-            else:
-                l = l_seg
+
+            seg_logits = seg_output[0] if self.enable_deep_supervision else seg_output  # (B, C, [D,] H, W)
+            pooled = seg_logits.mean(dim=tuple(range(2, seg_logits.ndim)))              # (B, C)
+            cls_logits = self.cls_head(pooled)                                          # (B, num_classes_cls)
+            l_cls = self.cls_loss(cls_logits, subtypes)
+
+            l = l_seg + (self.lambda_cls * l_cls if self.lambda_cls > 0 else 0)
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            torch.nn.utils.clip_grad_norm_(list(self.network.parameters()) + list(self.cls_head.parameters()), 12)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
             l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            torch.nn.utils.clip_grad_norm_(list(self.network.parameters()) + list(self.cls_head.parameters()), 12)
             self.optimizer.step()
         return {'loss': l.detach().cpu().numpy()}
 
@@ -1133,23 +1123,15 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=(self.device.type == 'cuda')):
             output = self.network(data)
             del data
-
-            # Handle dual head models
-            if isinstance(output, tuple):
-                seg_output, cls_output = output
-            else:
-                seg_output, cls_output = output, None
-
-            # Segmentation loss
+            seg_output = output[0] if isinstance(output, tuple) else output
             l_seg = self.loss(seg_output, target)
 
-            # Classification loss if head exists
-            l_cls = 0
-            if cls_output is not None:
-                l_cls = self.cls_loss(cls_output, subtypes)
+            seg_logits = seg_output[0] if self.enable_deep_supervision else seg_output
+            pooled = seg_logits.mean(dim=tuple(range(2, seg_logits.ndim)))
+            cls_logits = self.cls_head(pooled)
+            l_cls = self.cls_loss(cls_logits, subtypes)
 
-            # Total loss
-            l = l_seg + (self.lambda_cls * l_cls if cls_output is not None and self.lambda_cls > 0 else 0)
+            l = l_seg + (self.lambda_cls * l_cls if self.lambda_cls > 0 else 0)
 
         # Use highest resolution output for metrics when deep supervision is enabled
         if self.enable_deep_supervision:
@@ -1200,23 +1182,21 @@ class nnUNetTrainer(object):
             fn_hard = fn_hard[1:]
 
         # Classification metrics
-        cls_acc, cls_f1 = None, None
-        if cls_output is not None:
-            preds = torch.argmax(cls_output, dim=1)
-            correct = (preds == subtypes).sum().item()
-            total = subtypes.size(0)
-            cls_acc = correct / total
+        preds = torch.argmax(cls_logits, dim=1)
+        correct = (preds == subtypes).sum().item()
+        total = subtypes.size(0)
+        cls_acc = correct / total
 
-            preds_np = preds.detach().cpu().numpy()
-            true_np = subtypes.detach().cpu().numpy()
-            cls_f1 = f1_score(true_np, preds_np, average='macro')
+        preds_np = preds.detach().cpu().numpy()
+        true_np = subtypes.detach().cpu().numpy()
+        cls_f1 = f1_score(true_np, preds_np, average='macro')
 
         return {
             'loss': l.detach().cpu().numpy(),
             'tp_hard': tp_hard,
             'fp_hard': fp_hard,
             'fn_hard': fn_hard,
-            'cls_loss': l_cls.detach().cpu().numpy() if cls_output is not None else 0,
+            'cls_loss': l_cls.detach().cpu().numpy() if cls_logits is not None else 0,
             'cls_acc': cls_acc,
             'cls_f1': cls_f1
         }
@@ -1284,8 +1264,18 @@ class nnUNetTrainer(object):
                 "val/cls_f1": mean_cls_f1,
                 "val/cls_acc": mean_cls_acc,
                 "val/cls_loss": mean_cls_loss,
-                "epoch": self.current_epoch,
-            })
+                "epoch": self.current_epoch
+            }) 
+        
+        # Save best checkpoint based on pancreas DSC (class 0)
+        if not hasattr(self, "best_pancreas_dice"):
+            self.best_pancreas_dice = 0.0
+
+        pancreas_dice = float(global_dc_per_class[0]) if len(global_dc_per_class) > 0 else 0.0
+        if pancreas_dice > self.best_pancreas_dice:
+            self.best_pancreas_dice = pancreas_dice
+            self.print_to_log_file(f"New best pancreas DSC: {pancreas_dice:.4f}, saving checkpoint_best_pancreas.pth")
+            self.save_checkpoint(join(self.output_folder, "checkpoint_best_pancreas.pth"))
 
         # save best f1 checkpoint
         if not hasattr(self, "best_val_f1"):
@@ -1346,6 +1336,7 @@ class nnUNetTrainer(object):
                     'init_args': self.my_init_kwargs,
                     'trainer_name': self.__class__.__name__,
                     'inference_allowed_mirroring_axes': self.inference_allowed_mirroring_axes,
+                    'cls_head_state': self.cls_head.state_dict() if hasattr(self, 'cls_head') else None,
                 }
                 torch.save(checkpoint, filename)
             else:
@@ -1390,6 +1381,9 @@ class nnUNetTrainer(object):
         if self.grad_scaler is not None:
             if checkpoint['grad_scaler_state'] is not None:
                 self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
+        if 'cls_head_state' in checkpoint and checkpoint['cls_head_state'] is not None and hasattr(self, 'cls_head'):
+            self.cls_head.load_state_dict(checkpoint['cls_head_state'])
+            self.print_to_log_file("Classification head weights loaded successfully.")
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         self.set_deep_supervision_enabled(False)
